@@ -1,7 +1,7 @@
 #include "WebServerApp.h"
 
 #include <ESPAsyncWebServer.h>
-#include <functional>
+#include <stdio.h>
 
 #include "WebPages.h"
 #include "config.h"
@@ -13,19 +13,17 @@ String g_sessionToken;
 
 WebServerApp::WebServerApp(WiFiAccessPoint& accessPoint,
                            LedController& led,
-                           CyclicDataBuffer& dataBuffer,
+                           CyclicDataBuffer& temperatureBuffer,
+                           CyclicDataBuffer& humidityBuffer,
                            uint16_t port)
     : _accessPoint(accessPoint),
       _led(led),
-      _dataBuffer(dataBuffer),
+      _temperatureBuffer(temperatureBuffer),
+      _humidityBuffer(humidityBuffer),
       _port(port),
-      _currentState(false),
-      _previousState(false),
       _server(nullptr) {}
 
 bool WebServerApp::begin() {
-  _previousState = _currentState;
-
   if (_server != nullptr) {
     delete _server;
   }
@@ -36,33 +34,20 @@ bool WebServerApp::begin() {
 
   registerRoutes();
   _server->begin();
-
-  _currentState = true;
   return true;
 }
 
 void WebServerApp::update() {
-  _previousState = _currentState;
-  _currentState = _server != nullptr;
-}
-
-bool WebServerApp::getCurrentState() const {
-  return _currentState;
-}
-
-bool WebServerApp::getPreviousState() const {
-  return _previousState;
+  (void)_accessPoint;
 }
 
 void WebServerApp::registerRoutes() {
   _server->on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (g_sessionToken.length() > 0 &&
-        request->hasHeader("Cookie") &&
+    if (g_sessionToken.length() > 0 && request->hasHeader("Cookie") &&
         request->header("Cookie").indexOf(String(SESSION_COOKIE_NAME) + "=" + g_sessionToken) >= 0) {
       request->redirect("/led");
       return;
     }
-
     const bool showError = request->hasParam("error");
     request->send(200, "text/html; charset=utf-8", WebPages::loginPage(showError));
   });
@@ -87,28 +72,23 @@ void WebServerApp::registerRoutes() {
   });
 
   _server->on("/led", HTTP_GET, [this](AsyncWebServerRequest* request) {
-    requireAuth(request, [request]() {
-      request->send(200, "text/html; charset=utf-8", WebPages::ledPage());
-    });
+    requireAuth(request, [request]() { request->send(200, "text/html; charset=utf-8", WebPages::ledPage()); });
   });
 
   _server->on("/data", HTTP_GET, [this](AsyncWebServerRequest* request) {
-    requireAuth(request, [request]() {
-      request->send(200, "text/html; charset=utf-8", WebPages::dataPage());
-    });
+    requireAuth(request, [request]() { request->send(200, "text/html; charset=utf-8", WebPages::dataPage()); });
   });
 
   _server->on("/api/led/state", HTTP_GET, [this](AsyncWebServerRequest* request) {
     requireAuth(request, [this, request]() {
-      const String json = String(F("{\"on\":")) + (_led.getCurrentState() ? "true" : "false") + "}";
-      request->send(200, "application/json", json);
+      request->send(200, "application/json",
+                    String(F("{\"on\":")) + (_led.getCurrentState() ? "true" : "false") + "}");
     });
   });
 
   _server->on("/api/led/on", HTTP_POST, [this](AsyncWebServerRequest* request) {
     requireAuth(request, [this, request]() {
       _led.turnOn();
-      _led.update();
       request->send(200, "application/json", F("{\"ok\":true,\"on\":true}"));
     });
   });
@@ -116,34 +96,43 @@ void WebServerApp::registerRoutes() {
   _server->on("/api/led/off", HTTP_POST, [this](AsyncWebServerRequest* request) {
     requireAuth(request, [this, request]() {
       _led.turnOff();
-      _led.update();
       request->send(200, "application/json", F("{\"ok\":true,\"on\":false}"));
     });
   });
 
   _server->on("/api/data", HTTP_GET, [this](AsyncWebServerRequest* request) {
     requireAuth(request, [this, request]() {
-      const String json = String(F("{\"values\":")) + _dataBuffer.toJsonArray() + "}";
+      String json = F("{\"temperature\":");
+      json += _temperatureBuffer.toJsonArray();
+      json += F(",\"humidity\":");
+      json += _humidityBuffer.toJsonArray();
+      json += F(",\"timestamps\":");
+      json += _temperatureBuffer.toTimestampsJsonArray();
+      json += F(",\"count\":");
+      json += _temperatureBuffer.getCount();
+      char num[16];
+      json += F(",\"currentTemp\":");
+      snprintf(num, sizeof(num), "%.2f", _temperatureBuffer.getCurrentValue());
+      json += num;
+      json += F(",\"currentHum\":");
+      snprintf(num, sizeof(num), "%.2f", _humidityBuffer.getCurrentValue());
+      json += num;
+      json += '}';
       request->send(200, "application/json", json);
     });
   });
 
-  _server->onNotFound([](AsyncWebServerRequest* request) {
-    request->redirect("/");
-  });
+  _server->onNotFound([](AsyncWebServerRequest* request) { request->redirect("/"); });
 }
 
 bool WebServerApp::isAuthenticated(AsyncWebServerRequest* request) const {
   if (_sessionToken.length() == 0) {
     return false;
   }
-
-  const String cookieValue = readSessionFromCookie(request);
-  return cookieValue == _sessionToken;
+  return readSessionFromCookie(request) == _sessionToken;
 }
 
-void WebServerApp::requireAuth(AsyncWebServerRequest* request,
-                               std::function<void()> onSuccess) const {
+void WebServerApp::requireAuth(AsyncWebServerRequest* request, std::function<void()> onSuccess) const {
   if (!isAuthenticated(request)) {
     request->redirect("/");
     return;
@@ -174,9 +163,4 @@ String WebServerApp::readSessionFromCookie(AsyncWebServerRequest* request) const
 
 void WebServerApp::createSession() {
   _sessionToken = String(random(0x100000, 0xFFFFFF), HEX);
-}
-
-void WebServerApp::clearSession() {
-  _sessionToken = "";
-  g_sessionToken = "";
 }
